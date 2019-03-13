@@ -1,0 +1,304 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Linq;
+using TSLab.DataSource;
+using TSLab.Script.CanvasPane;
+using TSLab.Script.Options;
+using TSLab.Utils;
+
+namespace TSLab.Script.Handlers.Options
+{
+    /// <summary>
+    /// \~english Exchange smile (stream handler)
+    /// \~russian Биржевая улыбка (потоковый обработчик)
+    /// </summary>
+    [HandlerCategory(HandlerCategories.Options)]
+    [HelperName("Exchange Smile", Language = Constants.En)]
+    [HelperName("Биржевая улыбка", Language = Constants.Ru)]
+    [InputsCount(2)]
+    [Input(0, TemplateTypes.OPTION_SERIES, Name = Constants.OptionSeries)]
+    [Input(1, TemplateTypes.DOUBLE, Name = Constants.RiskFreeRate)]
+    [OutputType(TemplateTypes.INTERACTIVESPLINE)]
+    [Description("Биржевая улыбка (потоковый обработчик)")]
+    [HelperDescription("Exchange smile (stream handler)", Constants.En)]
+    public class ExchangeTheorSigma2 : BaseCanvasDrawing, IStreamHandler
+    {
+        private StrikeType m_optionType = StrikeType.Call;
+        private double m_multPx = 1, m_shiftPx = 0;
+
+        private TimeSpan m_expiryTime = TimeSpan.Parse(Constants.DefaultFortsExpiryTimeStr);
+        private string m_expiryTimeStr = Constants.DefaultFortsExpiryTimeStr;
+
+        #region Parameters
+        /// <summary>
+        /// \~english Option type (parameter Any is not recommended)
+        /// \~russian Тип опционов (использование типа Any может привести к неожиданному поведению)
+        /// </summary>
+        [HelperName("Option Type", Constants.En)]
+        [HelperName("Вид опционов", Constants.Ru)]
+        [Description("Тип опционов (использование типа Any может привести к неожиданному поведению)")]
+        [HelperDescription("Option type (parameter Any is not recommended)", Language = Constants.En)]
+        [HandlerParameter(true, NotOptimized = true, IsVisibleInBlock = true, Default = "Call")]
+        public StrikeType OptionType
+        {
+            get { return m_optionType; }
+            set { m_optionType = value; }
+        }
+
+        /// <summary>
+        /// \~english Price multiplier
+        /// \~russian Мультипликатор цен
+        /// </summary>
+        [HelperName("Multiplier", Constants.En)]
+        [HelperName("Мультипликатор", Constants.Ru)]
+        [Description("Мультипликатор цен")]
+        [HelperDescription("Price multiplier", Language = Constants.En)]
+        [HandlerParameter(true, NotOptimized = true, IsVisibleInBlock = true,
+            Default = "1", Min = "-1000000", Max = "1000000", Step = "1")]
+        public double MultiplierPx
+        {
+            get { return m_multPx; }
+            set { m_multPx = value; }
+        }
+
+        /// <summary>
+        /// \~english Price shift (price steps)
+        /// \~russian Сдвиг цен (в шагах цены)
+        /// </summary>
+        [HelperName("Shift", Constants.En)]
+        [HelperName("Сдвиг цен", Constants.Ru)]
+        [Description("Сдвиг цен (в шагах цены)")]
+        [HelperDescription("Price shift (price steps)", Language = Constants.En)]
+        [HandlerParameter(true, NotOptimized = true, IsVisibleInBlock = true,
+            Default = "0", Min = "-1000000", Max = "1000000", Step = "1")]
+        public double ShiftPx
+        {
+            get { return m_shiftPx; }
+            set { m_shiftPx = value; }
+        }
+
+        /// <summary>
+        /// \~english Exact expiration time of day (HH:mm)
+        /// \~russian Точное время экспирации (ЧЧ:мм)
+        /// </summary>
+        [HelperName("Expiry Time", Constants.En)]
+        [HelperName("Время истечения", Constants.Ru)]
+        [Description("Точное время экспирации (HH:mm)")]
+        [HelperDescription("Exact expiration time of day (HH:mm)", Language = Constants.En)]
+        [HandlerParameter(true, NotOptimized = true, IsVisibleInBlock = true,
+            Default = Constants.DefaultFortsExpiryTimeStr, Name = "Expiry Time")]
+        public string ExpiryTime
+        {
+            get { return m_expiryTimeStr; }
+            set
+            {
+                TimeSpan tmp;
+                if (TimeSpan.TryParse(value, out tmp))
+                {
+                    m_expiryTimeStr = value;
+                    m_expiryTime = tmp;
+                }
+            }
+        }
+        #endregion Parameters
+
+        /// <summary>
+        /// Обработчик под тип входных данных OPTION_SERIES
+        /// </summary>
+        public InteractiveSeries Execute(IOptionSeries optSer)
+        {
+            if (optSer == null)
+                return Constants.EmptySeries;
+
+            InteractiveSeries res = Execute(optSer, new[] { 0.0 });
+            return res;
+        }
+
+        /// <summary>
+        /// Обработчик под тип входных данных OPTION_SERIES
+        /// </summary>
+        public InteractiveSeries Execute(IOptionSeries optSer, IList<double> rates)
+        {
+            InteractiveSeries res = m_context.LoadObject(VariableId + "theorSmile") as InteractiveSeries;
+            if (res == null)
+            {
+                res = new InteractiveSeries(); // Здесь так надо -- мы делаем новую улыбку
+                m_context.StoreObject(VariableId + "theorSmile", res);
+            }
+
+            if (optSer == null)
+                return res;
+
+            int len = optSer.UnderlyingAsset.Bars.Count;
+            if (len <= 0)
+                return res;
+
+            FinInfo bSecFinInfo = optSer.UnderlyingAsset.FinInfo;
+            if (!bSecFinInfo.LastPrice.HasValue)
+                return res;
+
+            if (rates.Count <= 0)
+                //throw new ScriptException("There should be some values in second argument 'rates'.");
+                return res;
+
+            //IDataBar bar = optSer.UnderlyingAsset.Bars[len - 1];
+            double futPx = bSecFinInfo.LastPrice.Value;
+            // ФОРТС использует плоское календарное время
+            DateTime optExpiry = optSer.ExpirationDate.Date.Add(m_expiryTime);
+            double dT = (optExpiry - bSecFinInfo.LastUpdate).TotalYears();
+            double ratePct = rates[rates.Count - 1];
+            if (Double.IsNaN(dT) || (dT < Double.Epsilon))
+            {
+                // [{0}] Time to expiry must be positive value. dT:{1}
+                string msg = RM.GetStringFormat("OptHandlerMsg.TimeMustBePositive", GetType().Name, dT);
+                m_context.Log(msg, MessageType.Error, true);
+                return res;
+            }
+
+            if (Double.IsNaN(futPx) || (futPx < Double.Epsilon))
+            {
+                // [{0}] Base asset price must be positive value. F:{1}
+                string msg = RM.GetStringFormat("OptHandlerMsg.FutPxMustBePositive", GetType().Name, futPx);
+                m_context.Log(msg, MessageType.Error, true);
+                return res;
+            }
+
+            if (Double.IsNaN(ratePct))
+                //throw new ScriptException("Argument 'rate' contains NaN for some strange reason. rate:" + rate);
+                return res;
+
+            // TODO: переписаться на обновление старых значений
+            //res.ControlPoints.Clear();
+            List<InteractiveObject> controlPoints = new List<InteractiveObject>();
+
+            List<double> xs = new List<double>();
+            List<double> ys = new List<double>();
+            IOptionStrikePair[] pairs = (from pair in optSer.GetStrikePairs()
+                                         //orderby pair.Strike ascending -- уже отсортировано!
+                                         select pair).ToArray();
+            for (int j = 0; j < pairs.Length; j++)
+            {
+                bool showPoint = true;
+                IOptionStrikePair sInfo = pairs[j];
+                double k = sInfo.Strike;
+                //// Сверхдалекие страйки игнорируем
+                //if ((sInfo.Strike < m_minStrike) || (m_maxStrike < sInfo.Strike))
+                //{
+                //    showPoint = false;
+                //}
+
+                if ((sInfo.PutFinInfo == null) || (sInfo.CallFinInfo == null) ||
+                    (!sInfo.PutFinInfo.TheoreticalPrice.HasValue) || (!sInfo.PutFinInfo.Volatility.HasValue) ||
+                    (sInfo.PutFinInfo.TheoreticalPrice.Value <= 0) || (sInfo.PutFinInfo.Volatility.Value <= 0) ||
+                    (!sInfo.CallFinInfo.TheoreticalPrice.HasValue) || (!sInfo.CallFinInfo.Volatility.HasValue) ||
+                    (sInfo.CallFinInfo.TheoreticalPrice.Value <= 0) || (sInfo.CallFinInfo.Volatility.Value <= 0))
+                    continue;
+
+                double prec;
+                // Биржа шлет несогласованную улыбку
+                //double virtualExchangeF = sInfo.CallFinInfo.TheoreticalPrice.Value - sInfo.PutFinInfo.TheoreticalPrice.Value + sInfo.Strike;
+                if ((m_optionType == StrikeType.Any) || (m_optionType == StrikeType.Put))
+                {
+                    double optSigma = sInfo.PutFinInfo.Volatility.Value;
+                    if ((!DoubleUtil.IsOne(m_multPx)) || (!DoubleUtil.IsZero(m_shiftPx)))
+                    {
+                        double optPx = sInfo.PutFinInfo.TheoreticalPrice.Value * m_multPx + m_shiftPx * sInfo.Tick;
+                        if ((optPx <= 0) || (Double.IsNaN(optPx)))
+                            optSigma = 0;
+                        else
+                            optSigma = FinMath.GetOptionSigma(futPx, k, dT, optPx, ratePct, false, out prec);
+                    }
+
+                    double vol = optSigma;
+
+                    // ReSharper disable once UseObjectOrCollectionInitializer
+                    InteractivePointActive ip = new InteractivePointActive(k, vol);
+                    ip.Geometry = Geometries.Ellipse;
+                    ip.Color = AlphaColors.Cyan;
+                    ip.Tooltip = String.Format("K:{0}; IV:{1:0.00}", k, Constants.PctMult * optSigma);
+
+                    if (showPoint && (vol > 0))
+                    {
+                        controlPoints.Add(new InteractiveObject(ip));
+                    }
+
+                    if ((xs.Count <= 0) ||
+                        (!DoubleUtil.AreClose(k, xs[xs.Count - 1])))
+                    {
+                        xs.Add(k);
+                        ys.Add(vol);
+                    }
+                }
+
+                if ((m_optionType == StrikeType.Any) || (m_optionType == StrikeType.Call))
+                {
+                    double optSigma = sInfo.CallFinInfo.Volatility.Value;
+                    if ((!DoubleUtil.IsOne(m_multPx)) || (!DoubleUtil.IsZero(m_shiftPx)))
+                    {
+                        double optPx = sInfo.CallFinInfo.TheoreticalPrice.Value * m_multPx + m_shiftPx * sInfo.Tick;
+                        if ((optPx <= 0) || (Double.IsNaN(optPx)))
+                            optSigma = 0;
+                        else
+                            optSigma = FinMath.GetOptionSigma(futPx, k, dT, optPx, ratePct, true, out prec);
+                    }
+
+                    double vol = optSigma;
+
+                    // ReSharper disable once UseObjectOrCollectionInitializer
+                    InteractivePointActive ip = new InteractivePointActive(k, vol);
+                    ip.Geometry = Geometries.Ellipse;
+                    ip.Color = AlphaColors.DarkCyan;
+                    ip.Tooltip = String.Format("K:{0}; IV:{1:0.00}", k, Constants.PctMult * optSigma);
+
+                    if (showPoint && (vol > 0))
+                    {
+                        controlPoints.Add(new InteractiveObject(ip));
+                    }
+
+                    if ((xs.Count <= 0) ||
+                        (!DoubleUtil.AreClose(k, xs[xs.Count - 1])))
+                    {
+                        xs.Add(k);
+                        ys.Add(vol);
+                    }
+                }
+            }
+
+            res.ControlPoints = new ReadOnlyCollection<InteractiveObject>(controlPoints);
+
+            var baseSec = optSer.UnderlyingAsset;
+            DateTime scriptTime = baseSec.Bars[baseSec.Bars.Count - 1].Date;
+
+            // ReSharper disable once UseObjectOrCollectionInitializer
+            SmileInfo info = new SmileInfo();
+            info.F = futPx;
+            info.dT = dT;
+            info.Expiry = optSer.ExpirationDate;
+            info.ScriptTime = scriptTime;
+            info.RiskFreeRate = ratePct;
+            info.BaseTicker = baseSec.Symbol;
+
+            try
+            {
+                if (xs.Count >= BaseCubicSpline.MinNumberOfNodes)
+                {
+                    NotAKnotCubicSpline spline = new NotAKnotCubicSpline(xs, ys);
+
+                    info.ContinuousFunction = spline;
+                    info.ContinuousFunctionD1 = spline.DeriveD1();
+
+                    res.Tag = info;
+                }
+            }
+            catch (Exception ex)
+            {
+                m_context.Log(ex.ToString(), MessageType.Error, true);
+                return Constants.EmptySeries;
+            }
+
+            return res;
+        }
+    }
+}
